@@ -162,40 +162,43 @@ def run_simulation(mdp, n_trajectories, seed):
     
     # Example trajectories
     print("\nExample Trajectories and EIFs:")
-    for i in range(3):
+    for i in range(2):
         traj = mdp.simulate_trajectory()
         phi, terms = mdp.compute_eif(traj, rho_true, Q, V, mu)
         print(f"Trajectory {i+1}: {traj}")
         print(f"  EIF: {phi:.4f}, Terms: {terms:.4f}")
 
-# Example configuration (same as previous example)
-num_states = 2
-num_actions = 2
-T = 1
-s0 = 0
+def main():
+    # Example configuration (same as previous example)
+    num_states = 2
+    num_actions = 2
+    T = 1
+    s0 = 0
 
-# Transition matrix // this transition matrix is just an indication of the possible state change after taking some action. 
-P = np.zeros((num_states, num_actions, num_states))
-P[0, 0, 0] = 1.0  # s=0, a=0 -> s'=0
-P[0, 1, 1] = 1.0  # s=0, a=1 -> s'=1
-P[1, :, 1] = 1.0   # s=1, any a -> s'=1
+    # Transition matrix // this transition matrix is just an indication of the possible state change after taking some action. 
+    P = np.zeros((num_states, num_actions, num_states))
+    P[0, 0, 0] = 1.0  # s=0, a=0 -> s'=0
+    P[0, 1, 1] = 1.0  # s=0, a=1 -> s'=1
+    P[1, :, 1] = 1.0   # s=1, any a -> s'=1
 
-# Reward matrix
-R = np.zeros((num_states, num_actions))
-R[0, 1] = 1.0  # s=0, a=1 -> r=1
+    # Reward matrix
+    R = np.zeros((num_states, num_actions))
+    R[0, 1] = 1.0  # s=0, a=1 -> r=1
 
-# Policies
-pi_b = np.array([
-    [0.5, 0.5],
-    [1, 0]
-])
-pi_e = np.array([
-    [0, 1],
-    [0, 1]
-])
+    # Policies
+    pi_b = np.array([
+        [0.5, 0.5],
+        [1, 0]
+    ])
+    pi_e = np.array([
+        [0, 1],
+        [0, 1]
+    ])
 
-# Create and run MDP
-mdp = MDP(num_states, num_actions, T, s0, P, R, pi_b, pi_e)
-run_simulation(mdp, n_trajectories=2, seed=10)
+    # Create and run MDP
+    mdp = MDP(num_states, num_actions, T, s0, P, R, pi_b, pi_e)
+    run_simulation(mdp, n_trajectories=2, seed=10)
 
 
+if __name__ == "__main__":
+    main()
