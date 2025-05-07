@@ -170,34 +170,71 @@ def run_simulation(mdp, n_trajectories, seed):
 
 def main():
     # Example configuration (same as previous example)
-    num_states = 2
+    num_states = 3
     num_actions = 2
-    T = 1
+    T = 100
     s0 = 0
 
     # Transition matrix // this transition matrix is just an indication of the possible state change after taking some action. 
     P = np.zeros((num_states, num_actions, num_states))
     P[0, 0, 0] = 1.0  # s=0, a=0 -> s'=0
     P[0, 1, 1] = 1.0  # s=0, a=1 -> s'=1
-    P[1, :, 1] = 1.0   # s=1, any a -> s'=1
+    P[1, 0, 0] = 1.0  # s=0, a=0 -> s'=0  
+    P[1, 1, 2] = 1.0   # s=1, a=1 -> s'=2
+    P[2, : ,2] =1.0 # s=2, any a -> s'=2
+
+    P[0, 0] = [0.7, 0.3, 0.0]
+    P[0, 1] = [0.0, 0.4, 0.6]
+    P[1, 0] = [0.8, 0.0, 0.2]
+    P[1, 1] = [0.0, 0.5, 0.5]
+    P[2, :, 2] = 1.0
 
     # Reward matrix
     R = np.zeros((num_states, num_actions))
     R[0, 1] = 1.0  # s=0, a=1 -> r=1
+    R[0, 0] = 5.0  # s=0, a=0 -> r=5
 
     # Policies
     pi_b = np.array([
-        [0.5, 0.5],
-        [1, 0]
+        [0.3, 0.7],
+        [0.8, 0.2],
+        [0.1, 0.9]
     ])
     pi_e = np.array([
+        [0.5, 0.5],
         [0, 1],
         [0, 1]
     ])
 
     # Create and run MDP
     mdp = MDP(num_states, num_actions, T, s0, P, R, pi_b, pi_e)
-    run_simulation(mdp, n_trajectories=2, seed=10)
+    run_simulation(mdp, n_trajectories=1000, seed=10)
+
+        # Alternative configuration (3 states, different policies)
+    num_states = 3
+    num_actions = 2
+    T = 100
+    s0 = 0
+
+    # Example transition matrix (ring structure)
+    P = np.zeros((num_states, num_actions, num_states))
+    for s in range(num_states):
+        for a in range(num_actions):
+            s_next = (s + a + 1) % num_states
+            P[s, a, s_next] = 1.0
+
+    # Reward matrix
+    R = np.ones((num_states, num_actions)) * 0.5
+    R[0, 1] = 1.0  # Bonus reward
+
+    # Policies
+    pi_b = np.ones((num_states, num_actions)) / num_actions  # Uniform
+    pi_e = np.zeros((num_states, num_actions))
+    pi_e[:, 1] = 1.0  # Always action 1'
+
+    # Create and run MDP
+    mdp2 = MDP(num_states, num_actions, T, s0, P, R, pi_b, pi_e)
+    run_simulation(mdp2, n_trajectories=10, seed=10)
 
 
 if __name__ == "__main__":
