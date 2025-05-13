@@ -57,4 +57,3 @@ pip install numpy matplotlib
    plt.show()
    ```
 
-Feel free to adapt the notebooks for further examples and plots suited to your thesis.
