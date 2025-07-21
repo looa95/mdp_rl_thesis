@@ -10,6 +10,7 @@ This repository contains code for estimating the value of a target policy in a f
   * Importance weight (μ) calculation
   * Trajectory simulation under a behavior policy
   * EIF-based value estimation
+  * Doubly robust (DR) estimation with exact and misspecified models
 * **notebooks/**: Jupyter notebooks for examples and plots.
 
 ## Requirements
@@ -55,5 +56,11 @@ pip install numpy matplotlib
    import matplotlib.pyplot as plt
    plt.hist(eif_vals, bins=30)
    plt.show()
-   ```
 
+5. **Note** Complete example used for thesis can be findd in `simulation_thesis.ipynb`
+   ```python
+   from simulation_thesis import run_simulation, plot_results, plot_results2
+   results = run_simulation(mdp, 1000, seed=42)
+   plot_results(results, "1")
+   plot_results2(results, "1")
+   ```
