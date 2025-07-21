@@ -87,12 +87,14 @@ class MDP:
             mu.append(mu_t)
         return mu
 
-    def simulate_trajectory(self):
-        """Simulate one trajectory under behavior policy pi_b."""
+    def simulate_trajectory(self, policy=None):
+        """Simulate one trajectory under behavior policy """
+        if policy is None:
+            policy = self.pi_b
         trajectory = []
         s = self.s0
         for t in range(self.T + 1):
-            a = np.random.choice(self.num_actions, p=self.pi_b[s])
+            a = np.random.choice(self.num_actions, p=policy[s])
             r = self.R[s, a]
             trajectory.append((s, a, r))
             if t < self.T:
@@ -116,79 +118,78 @@ class MDP:
         return phi + terms, terms
 
 
-
-def estimate_nuisances(self, trajectories):
-    """Estimate Q_t and V_t using the given trajectories using least squares"""
-    Q_hat = [np.zeros((self.num_states, self.num_actions)) for _ in range(self.T + 1)]
-    V_hat = [np.zeros(self.num_states) for _ in range(self.T + 1)]
-    counts = [np.zeros((self.num_states, self.num_actions)) for _ in range(self.T + 1)]
-    
-    for traj in trajectories:
+    def estimate_nuisances(self, trajectories):
+        """Estimate Q_t and V_t using the given trajectories using least squares"""
+        Q_hat = [np.zeros((self.num_states, self.num_actions)) for _ in range(self.T + 1)]
+        V_hat = [np.zeros(self.num_states) for _ in range(self.T + 1)]
+        counts = [np.zeros((self.num_states, self.num_actions)) for _ in range(self.T + 1)]
+        
+        for traj in trajectories:
+            for t in range(self.T + 1):
+                s, a, r = traj[t]
+                counts[t][s, a] += 1
+                future_reward = 0.0
+                disc = 1.0
+                for tt in range(t, self.T + 1):
+                    future_reward += disc * traj[tt][2]
+                    disc *= self.gamma
+                Q_hat[t][s, a] += future_reward
+                
         for t in range(self.T + 1):
-            s, a, r = traj[t]
-            counts[t][s, a] += 1
-            future_reward = 0.0
-            disc = 1.0
-            for tt in range(t, self.T + 1):
-                future_reward += disc * traj[tt][2]
-                disc *= self.gamma
-            Q_hat[t][s, a] += future_reward
-            
-    for t in range(self.T + 1):
-        for s in range(self.num_states):
-            for a in range(self.num_actions):
-                if counts[t][s, a] > 0:
-                    Q_hat[t][s, a] /= counts[t][s, a]
-            V_hat[t][s] = np.sum(self.pi_e[s] * Q_hat[t][s])
-    return Q_hat, V_hat
+            for s in range(self.num_states):
+                for a in range(self.num_actions):
+                    if counts[t][s, a] > 0:
+                        Q_hat[t][s, a] /= counts[t][s, a]
+                V_hat[t][s] = np.sum(self.pi_e[s] * Q_hat[t][s])
+        return Q_hat, V_hat
 
-def estimate_mu(self, trajectories):
-    """Estimate marginalized density ratios mu_t(s, a) = p_pi^e(t, s, a) / p_pi^b(t, s, a) """
-    d_b_hat = np.zeros((self.T + 1, self.num_states, self.num_actions))
-    n = len(trajectories)
-    for traj in trajectories:
+    def estimate_mu(self, trajectories):
+        """Estimate marginalized density ratios mu_t(s, a) = p_pi^e(t, s, a) / p_pi^b(t, s, a) """
+        d_b_hat = np.zeros((self.T + 1, self.num_states, self.num_actions))
+        n = len(trajectories)
+        for traj in trajectories:
+            for t in range(self.T + 1):
+                s, a, _ = traj[t]
+                d_b_hat[t, s, a] += 1 / n
+        
+        d_e_hat = np.zeros_like(d_b_hat)
+        for traj in trajectories:
+            cum_w = 1.0
+            for t in range(self.T + 1):
+                s, a, _ = traj[t]
+                w = self.pi_e[s, a] / self.pi_b[s, a] if self.pi_b[s, a] > 0 else 0
+                cum_w *= w
+                d_e_hat[t, s, a] += cum_w / n
+        
+        mu_hat = []
         for t in range(self.T + 1):
-            s, a, _ = traj[t]
-            d_b_hat[t, s, a] += 1 / n
-    
-    d_e_hat = np.zeros_like(d_b_hat)
-    for traj in trajectories:
-        cum_w = 1.0
-        for t in range(self.T + 1):
-            s, a, _ = traj[t]
-            w = self.pi_e[s, a] / self.pi_b[s, a] if self.pi_b[s, a] > 0 else 0
-            cum_w *= w
-            d_e_hat[t, s, a] += cum_w / n
-    
-    mu_hat = []
-    for t in range(self.T + 1):
-        mu_t = np.zeros((self.num_states, self.num_actions))
-        mask = d_b_hat[t] > 0
-        mu_t[mask] = d_e_hat[t][mask] / d_b_hat[t][mask]
-        mu_hat.append(mu_t)
-    return mu_hat
+            mu_t = np.zeros((self.num_states, self.num_actions))
+            mask = d_b_hat[t] > 0
+            mu_t[mask] = d_e_hat[t][mask] / d_b_hat[t][mask]
+            mu_hat.append(mu_t)
+        return mu_hat
 
-def drl_estimator(self, trajectories):
-    """ Double RL estimator with cross-fitting K=2 folds"""
-    n = len(trajectories)
-    if n < 2:
-        return 0.0
-    fold1 = trajectories[:n//2]
-    fold2 = trajectories[n//2:]
-    
-    Q1, V1 = self.estimate_nuisances(fold1)
-    mu1 = self.estimate_mu(fold1)
-    Q2, V2 = self.estimate_nuisances(fold2)
-    mu2 = self.estimate_mu(fold2)
-    
-    est = 0.0
-    for traj in fold1:
-        _, terms = self.compute_eif(traj, 0, Q2, V2, mu2)  # rho=0 to get terms as est component
-        est += terms / n
-    for traj in fold2:
-        _, terms = self.compute_eif(traj, 0, Q1, V1, mu1)
-        est += terms / n
-    return est
+    def drl_estimator(self, trajectories):
+        """ Double RL estimator with cross-fitting K=2 folds"""
+        n = len(trajectories)
+        if n < 2:
+            return 0.0
+        fold1 = trajectories[:n//2]
+        fold2 = trajectories[n//2:]
+        
+        Q1, V1 = self.estimate_nuisances(fold1)
+        mu1 = self.estimate_mu(fold1)
+        Q2, V2 = self.estimate_nuisances(fold2)
+        mu2 = self.estimate_mu(fold2)
+        
+        est = 0.0
+        for traj in fold1:
+            _, terms = self.compute_eif(traj, 0, Q2, V2, mu2)  # rho=0 to get terms as est component
+            est += terms / n
+        for traj in fold2:
+            _, terms = self.compute_eif(traj, 0, Q1, V1, mu1)
+            est += terms / n
+        return est
 
 
 def run_simulation(mdp, n_trajectories, seed=None):
@@ -199,39 +200,62 @@ def run_simulation(mdp, n_trajectories, seed=None):
     Q_exact, V_exact = mdp.compute_values()
     mu_exact= mdp.compute_mu()
     rho_true = V_exact[0][mdp.s0]
-    trajectories = [mdp.simulate_trajectory() for _ in range(n_trajectories)]
+    
+    # Trajectories under behavior policy (pi_b)
+    traj_b = [mdp.simulate_trajectory() for _ in range(n_trajectories)]
+    # Trajectories under evaluation policy (pi_e)
+    traj_e = [mdp.simulate_trajectory(policy=mdp.pi_e) for _ in range(n_trajectories)]
     eif_vals = []
     term_vals = []
-    for traj in trajectories:
+    for traj in traj_b:
         phi, terms = mdp.compute_eif(traj, rho_true, Q_exact, V_exact, mu_exact)
         eif_vals.append(phi)
         term_vals.append(terms)
+    cum_rewards_e = []  # For empirical average under pi_e
+    for traj in traj_e:
+        cum_r = sum(r for _, _, r in traj)  # Cumulative reward (undiscounted)
+        cum_rewards_e.append(cum_r)
+    
+    avg_cum_e = np.mean(cum_rewards_e)
     
     eif_mean = np.mean(eif_vals)
     eif_var = np.var(eif_vals)
     rho_est_exact= np.mean(term_vals)
-    rho_drl = mdp.drl_estimator(trajectories)
+    rho_drl = mdp.drl_estimator(traj_b)
 
     # Variance over runs
-    drl_estimates = [mdp.drl_estimator([mdp.simulate_trajectory() for _ in range(n_trajectories)]) for _ in range(10)]
+    drl_estimates = [mdp.drl_estimator([mdp.simulate_trajectory() for _ in range(n_trajectories)]) for _ in range(mdp.T )]
     drl_var = np.var(drl_estimates)
     bound = eif_var / n_trajectories
     # DR demo
-    Q_random = [np.random.uniform(-10, 10, (mdp.num_states, mdp.num_actions)) for _ in range(mdp.T + 1)]
+    num_of_runs = 10
+    Q_random = [np.random.uniform(-num_of_runs, num_of_runs, (mdp.num_states, mdp.num_actions)) for _ in range(mdp.T + 1)]
     V_random = [np.sum(mdp.pi_e * Q_random[t], axis=1) for t in range(mdp.T + 1)]
-    rho_miss_model = np.mean([mdp.compute_eif(traj, 0, Q_random, V_random, mu_exact)[1] for traj in trajectories])
+    rho_miss_model = np.mean([mdp.compute_eif(traj, 0, Q_random, V_random, mu_exact)[1] for traj in traj_b])
     mu_random = [np.random.uniform(0, 2, (mdp.num_states, mdp.num_actions)) for _ in range(mdp.T + 1)]
-    rho_miss_weights = np.mean([mdp.compute_eif(traj, 0, Q_exact, V_exact, mu_random)[1] for traj in trajectories]
+    rho_miss_weights = np.mean([mdp.compute_eif(traj, 0, Q_exact, V_exact, mu_random)[1] for traj in traj_b])
 
     
     print(f"True rho^{{pi^e}}: {rho_true:.4f}")
+    print(f"Empirical average cumulative reward under pi_e: {avg_cum_e:.4f}")
     print(f"Average EIF: {eif_mean:.4f}")
     print(f"EIF variance: {eif_var:.4f}")
     print(f"Estimated rho from exact terms: {rho_est_exact:.4f}")
     print(f"DRL estimate (est nuisances): {rho_drl:.4f}")
-    print(f"DRL variance (10 runs): {drl_var:.4f}")
+    print(f"DRL variance ({num_of_runs} runs): {drl_var:.4f}")
     print(f"Efficiency bound (Var(EIF)/n): {bound:.4f}")
     print(f"DR with misspecified model (Q/V random, mu exact): {rho_miss_model:.4f}")
     print(f"DR with misspecified weights (mu random, Q/V exact): {rho_miss_weights:.4f}")
-    
-    return np.array(eif_vals), np.array(term_vals)
+
+    # Return data for plotting
+    cum_rewards_b = [sum(r for _, _, r in traj) for traj in traj_b]
+
+    return {
+        'eif_vals': eif_vals,
+        'cum_rewards_e': cum_rewards_e,
+        'rho_true': rho_true,
+        'avg_cum_e': avg_cum_e,
+        'rho_drl': rho_drl,
+        'term_vals': term_vals,
+        'cum_rewards_b': cum_rewards_b
+    }
