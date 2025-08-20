@@ -63,12 +63,34 @@ class HighwayMultiAgentEnvSQL:
         self.lane_directions = np.array(lane_directions, dtype=int)
         self.lane_centers_y = np.arange(num_lanes_total, dtype=float) * lane_width
 
-        # --- Initial positions/speeds/lanes ---
-        gaps = self.L / self.N
-        self.x0 = np.array([i * gaps + self.rng.uniform(-0.2*gaps, 0.2*gaps) for i in range(self.N)], dtype=float)
+        # --- Initial positions/speeds/lanes with min gap ---
+        self.x0 = np.full(self.N, np.nan)
         self.v0 = self.rng.uniform(self.v_min, self.v_max, size=self.N)
+
         # random lanes with mild balance
         self.lane0 = self.rng.integers(low=0, high=self.num_lanes_total, size=self.N)
+
+        min_gap = 2.0  # meters
+        for lane in range(self.num_lanes_total):
+            idx = np.where(self.lane0 == lane)[0]
+            if idx.size == 0:
+                continue
+            # equally spaced within lane
+            gaps = self.L / idx.size
+            positions = np.array([k * gaps for k in range(idx.size)], dtype=float)
+            # add small jitter but keep min_gap
+            jitter = self.rng.uniform(-0.2*gaps, 0.2*gaps, size=idx.size)
+            positions = (positions + jitter) % self.L
+            positions.sort()
+            # enforce min_gap
+            for j in range(1, len(positions)):
+                if positions[j] - positions[j-1] < min_gap:
+                    positions[j] = positions[j-1] + min_gap
+            # wrap last vs first
+            if (self.L + positions[0] - positions[-1]) % self.L < min_gap:
+                positions[-1] = (positions[0] - min_gap) % self.L
+            self.x0[idx] = positions
+
         # Per-agent TX power (dBm)
         if tx_power_dbm is None:
             self.tx_power_dbm = self.rng.integers(low=18, high=34, size=self.N)  # 18..33
