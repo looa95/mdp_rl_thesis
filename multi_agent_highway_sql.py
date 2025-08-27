@@ -158,6 +158,137 @@ class HighwayMultiAgentEnvSQL:
         except Exception:
             pass
         return None
+    
+    def compute_tx_power_mw(self, tx_power_dbm:float) -> float:
+        """
+        Convert transmit power from dBm to mW.
+        """
+        return 10 ** ((tx_power_dbm ) / 10) 
+    
+    # ---------- 3GPP LOS/NLOSv probabilities ----------
+    
+    def p_los_highway(self, distance_m: float) -> float:
+        """
+        Probability of LOS (Line of Sight) according to 3GPP TR 38.901 Table 6.2-1 (Highway).
+        """
+        d = float(distance_m)
+        if d <= 475.0:
+            a, b, c = 2.1013e-6, -0.002, 1.0193
+            p_los = a * d**2 + b * d + c
+            return min(1.0, max(0.0, p_los))
+        else:
+            p_los = 0.54 - 0.001 * (d - 475.0)
+            return max(0.0, min(1.0, p_los))
+
+    def p_nlos_highway(self, distance_m: float) -> float:
+        """
+        Probability of NLOSv (non-LOS for vehicles).
+        """
+        return 1.0 - self.p_los_highway(distance_m)
+    
+
+    def compute_path_loss(self, distance_m: float, n_los: float = 2.0, n_nlos: float = 3.5) -> float:
+        """
+        Distance-based path loss with stochastic LOS/NLOS according to 3GPP 38.901.
+        """
+        p_los = self.p_los_highway(distance_m)
+        if self.rng.random() < p_los:
+            n = n_los
+        else:
+            n = n_nlos
+        return 1.0 / (distance_m**n + 1e-9)
+    
+    def _path_loss_gain_sample(self, d_m: float, n_los: float, n_nlos: float) -> float:
+        """
+        Sample LOS/NLOS according to 3GPP highway model and return linear path-loss gain ~ 1/d^n.
+        This is stochastic (uses self.rng).
+        """
+        # clamp very small distances to avoid blow-up
+        d = max(1e-3, float(d_m))
+
+        # sample LOS vs NLOS
+        if self.rng.random() < self.p_los_highway(d):
+            n = n_los
+        else:
+            n = n_nlos
+
+        # simple power-law gain; you can replace by log-distance with reference if you like
+        return 1.0 / (d ** n + 1e-12)
+    
+    def compute_sinr(self, tx_idx: int, actions: np.ndarray, noise_mw: float = 1e-9) -> float:
+        """
+        Compute SINR for agent `tx_idx` given current positions/lanes.
+        - Uses distance-based path loss.
+        - S = desired power from self transmitter.
+        - I = sum of powers from all other co-channel transmitters.
+        - N = thermal noise (default very small).
+        
+        Returns SINR (linear ratio).
+        """
+        ai = actions[tx_idx]
+        xi, yi = self.x[tx_idx], self._lane_y(self.lane)[tx_idx]
+        pt_dbm = self.tx_power_dbm[tx_idx]
+        pt_mw = self.compute_tx_power_mw(pt_dbm)
+
+        # Desired received power
+        S = pt_mw * self.compute_path_loss(1.0)  # assume 1 m reference distance
+
+        I = 0.0
+        for j in range(self.N):
+            if j == tx_idx or actions[j] != ai:
+                continue
+            xj, yj = self.x[j], self._lane_y(self.lane)[j]
+            d = self._ring_distance_2d(xi, yi, xj, yj)
+            ptj_mw = self.compute_tx_power_mw(self.tx_power_dbm[j])
+            I += ptj_mw * self.compute_path_loss(d)
+
+        SINR = S / (I + noise_mw)
+        return SINR
+    def compute_sinr_linear(self, tx_idx: int, actions: np.ndarray) -> float:
+        """
+        SINR = S / (I + N) in linear units (mW/mW).
+        - Desired received power S: uses a configurable desired-link distance.
+        - Interference I: sum of *all* co-channel interferers within interference_max_range.
+        - Thermal noise N: self.noise_mw (mW).
+        - LOS/NLOS for each link is sampled *every call* from the 3GPP highway P(LOS).
+        """
+        ai = int(actions[tx_idx])
+        # tx position (proxy for Rx position in this simplified model)
+        y_now = self._lane_y(self.lane)
+        xi, yi = float(self.x[tx_idx]), float(y_now[tx_idx])
+
+        # --- Desired signal ---
+        pt_dbm = float(self.tx_power_dbm[tx_idx])
+        pt_mw  = self._dbm_to_mw(pt_dbm)
+        # Use a small configurable desired-link distance (proxy to paired Rx)
+        d_sig = float(self.desired_link_distance_m)
+        g_sig = self._path_loss_gain_sample(d_sig, self.pathloss_n_los, self.pathloss_n_nlos)
+        S = pt_mw * g_sig
+
+        # --- Interference (sum over all co-channel interferers within range) ---
+        I = 0.0
+        for j in range(self.N):
+            if j == tx_idx or int(actions[j]) != ai:
+                continue
+            xj, yj = float(self.x[j]), float(y_now[j])
+            d_ij = self._ring_distance_2d(xi, yi, xj, yj)
+            if d_ij > self.interf_range:
+                continue
+            ptj_dbm = float(self.tx_power_dbm[j])
+            ptj_mw  = self._dbm_to_mw(ptj_dbm)
+            g_ij = self._path_loss_gain_sample(d_ij, self.pathloss_n_los, self.pathloss_n_nlos)
+            I += ptj_mw * g_ij
+
+        # --- Noise ---
+        N = float(self.noise_mw)
+
+        return S / (I + N + 1e-18)
+
+    def compute_sinr_db(self, tx_idx: int, actions: np.ndarray) -> float:
+        sinr_lin = self.compute_sinr_linear(tx_idx, actions)
+        return 10.0 * np.log10(max(1e-18, sinr_lin))
+
+
 
     # ---------- Helpers: geometry, distances, history ----------
     def _lane_y(self, lane_idx: np.ndarray) -> np.ndarray:
