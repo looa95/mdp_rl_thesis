@@ -4,7 +4,7 @@ from typing import List, Tuple, Dict, Optional
 
 class HighwayMultiAgentEnvSQL:
     """
-    Multi-agent highway Markov game with DB-backed SNR and lane/direction geometry.
+    Multi-agent highway Markov game with analytic SINR and 3GPP LOS/NLOS sampling.
 
     Geometry:
       - Ring road in x with length L; lanes are parallel lines at y = lane_index * lane_width.
@@ -13,9 +13,15 @@ class HighwayMultiAgentEnvSQL:
 
     Dynamics:
       - Each step, every agent chooses resource a in {0,1,2}.
-      - Success/collision decided by SNR from SQLite DB using (resource, tx_power_dbm, Euclidean distance).
-      - Kinematics: x <- (x + dir * v * dt) mod L. v has small Gaussian jitter; lanes don't change in this minimal model
-        (easy to extend with lane-change actions later).
+      - Radio: For each agent, compute SINR = S / (I + N) in linear units.
+        * S uses a desired-link distance with stochastic LOS/NLOS (3GPP TR 38.901 highway P(LOS)).
+        * I sums all co-channel interferers within `interference_max_range`, each with its own sampled LOS/NLOS.
+        * N is thermal noise (mW).
+      - Success / collision is decided by a probability fetched from SQLite:
+        1) Try table `snr_success_prob` (binned by SNR dB, per resource).
+        2) Else, linearly interpolate from `snr_success_curve` (points), per resource.
+        If no DB mapping applies, default p_success = 0.0 (collision).
+      - Kinematics: x <- (x + dir * v * dt) mod L. v has small Gaussian jitter; lanes are static in this minimal model.
 
     Labels: 0=idle, 1=success, 2=collision, 3=unavailable.
     """
@@ -35,22 +41,16 @@ class HighwayMultiAgentEnvSQL:
         tx_power_dbm: Optional[np.ndarray] = None,
         # --- geometry params ---
         num_lanes_total: int = 4,
-        lane_width: float = 4,
+        lane_width: float = 4.0,
         lane_directions: Optional[List[int]] = None,  # e.g., [+1,+1,-1,-1]; if None, first half +1, rest -1
         store_history: bool = True,
-        #radio propagation params
-        noise_mw: float = 1e-9,  # thermal noise in mW
-        pathloss_n_los: float = 2.0,  # path-loss exponent for LOS
-        pathloss_n_nlos: float = 3.5,  # path-loss exponent for NLOS
-        desired_link_distance_m: float = 10.0, # desired signal link distance in meters
-        # -- decision rules --
-        snr_success_mode: str = "deterministic", #deterministic or stochastic
-        snr_prob_alpha: float = .8, #only for stochastic mode, controls steepness of logistic success probability
-        # -- init spacing
-        min_initial_gap: float = 2.0  # meters ≥2 m within each lane at t=0
-
-
-
+        # --- radio propagation params ---
+        noise_mw: float = 1e-9,              # thermal noise in mW
+        pathloss_n_los: float = 2.0,         # LOS path-loss exponent
+        pathloss_n_nlos: float = 3.5,        # NLOS path-loss exponent
+        desired_link_distance_m: float = 10.0,  # desired signal link distance in meters
+        # --- init spacing ---
+        min_initial_gap: float = 2.0         # meters; ≥2 m within each lane at t=0
     ) -> None:
         self.N = num_agents
         self.T = T
@@ -63,22 +63,20 @@ class HighwayMultiAgentEnvSQL:
         self.db_path = db_path
         self.rng = np.random.default_rng(seed)
         self.R = 3  # actions/resources
+
+        # Radio / propagation params
         self.noise_mw = noise_mw
         self.pathloss_n_los = pathloss_n_los
         self.pathloss_n_nlos = pathloss_n_nlos
         self.desired_link_distance_m = desired_link_distance_m
-        self.snr_success_mode = snr_success_mode
-        self.snr_prob_alpha = snr_prob_alpha
-        self.min_initial_gap = min_initial_gap
 
-        min_gap=self.min_initial_gap
         # --- Lanes / directions ---
         assert num_lanes_total >= 1
         self.num_lanes_total = num_lanes_total
         self.lane_width = lane_width
         if lane_directions is None:
             half = num_lanes_total // 2
-            lane_directions = [+1]*max(1, half) + [-1]*(num_lanes_total - max(1, half))
+            lane_directions = [+1] * max(1, half) + [-1] * (num_lanes_total - max(1, half))
         assert len(lane_directions) == num_lanes_total
         assert all(d in (-1, +1) for d in lane_directions)
         self.lane_directions = np.array(lane_directions, dtype=int)
@@ -91,7 +89,7 @@ class HighwayMultiAgentEnvSQL:
         # random lanes with mild balance
         self.lane0 = self.rng.integers(low=0, high=self.num_lanes_total, size=self.N)
 
-        min_gap = 2.0  # meters
+        min_gap = min_initial_gap  # use configured gap
         for lane in range(self.num_lanes_total):
             idx = np.where(self.lane0 == lane)[0]
             if idx.size == 0:
@@ -100,13 +98,13 @@ class HighwayMultiAgentEnvSQL:
             gaps = self.L / idx.size
             positions = np.array([k * gaps for k in range(idx.size)], dtype=float)
             # add small jitter but keep min_gap
-            jitter = self.rng.uniform(-0.2*gaps, 0.2*gaps, size=idx.size)
+            jitter = self.rng.uniform(-0.2 * gaps, 0.2 * gaps, size=idx.size)
             positions = (positions + jitter) % self.L
             positions.sort()
             # enforce min_gap
             for j in range(1, len(positions)):
-                if positions[j] - positions[j-1] < min_gap:
-                    positions[j] = positions[j-1] + min_gap
+                if positions[j] - positions[j - 1] < min_gap:
+                    positions[j] = positions[j - 1] + min_gap
             # wrap last vs first
             if (self.L + positions[0] - positions[-1]) % self.L < min_gap:
                 positions[-1] = (positions[0] - min_gap) % self.L
@@ -122,9 +120,6 @@ class HighwayMultiAgentEnvSQL:
         # Labels
         self.S_labels = ["idle", "success", "collision", "unavailable"]
 
-        # Threshold from DB
-        self.snr_success_thresh_db = self._get_snr_threshold()
-
         # History buffers
         self.store_history = store_history
         self._reset_history()
@@ -133,45 +128,25 @@ class HighwayMultiAgentEnvSQL:
     def _connect(self):
         return sqlite3.connect(self.db_path)
 
-    def _get_snr_threshold(self) -> float:
-        try:
-            with self._connect() as conn:
-                cur = conn.cursor()
-                cur.execute("SELECT value FROM params WHERE key='snr_success_thresh_db'")
-                row = cur.fetchone()
-                return float(row[0]) if row else 5.0
-        except Exception:
-            return 5.0
-
-    def _snr_lookup(self, resource: int, tx_power_dbm: int, distance_m: float) -> Optional[float]:
+    def _p_success_from_snr_bin(self, resource: int, snr_db: float) -> Optional[float]:
         """
-        Return SNR (dB) from snr_lookup by (resource, distance bin, power bin or nearest).
+        Look up P(success) from 'snr_success_prob' table by resource and SNR bin.
+        Returns None if no matching bin is found or on DB error.
+        Schema:
+          snr_success_prob(resource INTEGER, snr_min_db REAL, snr_max_db REAL, p_success REAL)
         """
         try:
             with self._connect() as conn:
                 cur = conn.cursor()
-                # exact power bin
                 cur.execute(
                     """
-                    SELECT snr_db FROM snr_lookup
-                    WHERE resource=? AND tx_power_dbm=? AND ? >= dist_min AND ? < dist_max
+                    SELECT p_success
+                    FROM snr_success_prob
+                    WHERE resource = ?
+                      AND ? >= snr_min_db AND ? < snr_max_db
                     LIMIT 1
                     """,
-                    (int(resource), int(tx_power_dbm), float(distance_m), float(distance_m))
-                )
-                row = cur.fetchone()
-                if row:
-                    return float(row[0])
-                # nearest power bin
-                cur.execute(
-                    """
-                    SELECT snr_db, ABS(tx_power_dbm - ?) AS delta
-                    FROM snr_lookup
-                    WHERE resource=? AND ? >= dist_min AND ? < dist_max
-                    ORDER BY delta ASC
-                    LIMIT 1
-                    """,
-                    (int(tx_power_dbm), int(resource), float(distance_m), float(distance_m))
+                    (int(resource), float(snr_db), float(snr_db))
                 )
                 row = cur.fetchone()
                 if row:
@@ -179,15 +154,55 @@ class HighwayMultiAgentEnvSQL:
         except Exception:
             pass
         return None
-    
-    def compute_tx_power_mw(self, tx_power_dbm:float) -> float:
+
+    def _p_success_from_snr_interp(self, resource: int, snr_db: float) -> Optional[float]:
         """
-        Convert transmit power from dBm to mW.
+        Linearly interpolate P(success) from 'snr_success_curve' points.
+        Requires at least one point on each side to interpolate; otherwise uses nearest.
+        Schema:
+          snr_success_curve(resource INTEGER, snr_db REAL, p_success REAL)
         """
-        return 10 ** ((tx_power_dbm ) / 10) 
-    
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                # left <= snr_db
+                cur.execute(
+                    """
+                    SELECT snr_db, p_success
+                    FROM snr_success_curve
+                    WHERE resource = ? AND snr_db <= ?
+                    ORDER BY snr_db DESC LIMIT 1
+                    """,
+                    (int(resource), float(snr_db))
+                )
+                left = cur.fetchone()
+                # right > snr_db
+                cur.execute(
+                    """
+                    SELECT snr_db, p_success
+                    FROM snr_success_curve
+                    WHERE resource = ? AND snr_db > ?
+                    ORDER BY snr_db ASC LIMIT 1
+                    """,
+                    (int(resource), float(snr_db))
+                )
+                right = cur.fetchone()
+            if left and right:
+                x0, y0 = float(left[0]), float(left[1])
+                x1, y1 = float(right[0]), float(right[1])
+                if x1 == x0:
+                    return max(0.0, min(1.0, 0.5 * (y0 + y1)))
+                t = (snr_db - x0) / (x1 - x0)
+                return max(0.0, min(1.0, y0 + t * (y1 - y0)))
+            elif left:
+                return max(0.0, min(1.0, float(left[1])))
+            elif right:
+                return max(0.0, min(1.0, float(right[1])))
+        except Exception:
+            pass
+        return None
+
     # ---------- 3GPP LOS/NLOSv probabilities ----------
-    
     def p_los_highway(self, distance_m: float) -> float:
         """
         Probability of LOS (Line of Sight) according to 3GPP TR 38.901 Table 6.2-1 (Highway).
@@ -202,62 +217,45 @@ class HighwayMultiAgentEnvSQL:
             return max(0.0, min(1.0, p_los))
 
     def p_nlos_highway(self, distance_m: float) -> float:
-        """
-        Probability of NLOSv (non-LOS for vehicles).
-        """
+        """P(NLOSv) = 1 - P_LOS."""
         return 1.0 - self.p_los_highway(distance_m)
-    
 
-    def compute_path_loss(self, distance_m: float, n_los: float = 2.0, n_nlos: float = 3.5) -> float:
-        """
-        Distance-based path loss with stochastic LOS/NLOS according to 3GPP 38.901.
-        """
-        p_los = self.p_los_highway(distance_m)
-        if self.rng.random() < p_los:
-            n = n_los
-        else:
-            n = n_nlos
-        return 1.0 / (distance_m**n + 1e-9)
-    
+    # ---------- Radio helpers ----------
+    def compute_tx_power_mw(self, tx_power_dbm: float) -> float:
+        """Convert transmit power from dBm to mW."""
+        return 10.0 ** (tx_power_dbm / 10.0)
+
     def _path_loss_gain_sample(self, d_m: float, n_los: float, n_nlos: float) -> float:
         """
         Sample LOS/NLOS according to 3GPP highway model and return linear path-loss gain ~ 1/d^n.
         This is stochastic (uses self.rng).
         """
-        # clamp very small distances to avoid blow-up
-        d = max(1e-3, float(d_m))
-
-        # sample LOS vs NLOS
+        d = max(1e-3, float(d_m))  # clamp very small distances
         if self.rng.random() < self.p_los_highway(d):
             n = n_los
         else:
             n = n_nlos
+        return 1.0 / (d**n + 1e-12)
 
-        # simple power-law gain; you can replace by log-distance with reference if you like
-        return 1.0 / (d ** n + 1e-12)
-    
     def compute_sinr_linear(self, tx_idx: int, actions: np.ndarray) -> float:
         """
         SINR = S / (I + N) in linear units (mW/mW).
-        - Desired received power S: uses a configurable desired-link distance.
-        - Interference I: sum of *all* co-channel interferers within interference_max_range.
+        - Desired received power S: uses a configurable desired-link distance with LOS/NLOS sampling.
+        - Interference I: sum of all co-channel interferers within interference_max_range, each sampled LOS/NLOS.
         - Thermal noise N: self.noise_mw (mW).
-        - LOS/NLOS for each link is sampled *every call* from the 3GPP highway P(LOS).
         """
         ai = int(actions[tx_idx])
-        # tx position (proxy for Rx position in this simplified model)
         y_now = self._lane_y(self.lane)
         xi, yi = float(self.x[tx_idx]), float(y_now[tx_idx])
 
-        # --- Desired signal ---
+        # Desired signal
         pt_dbm = float(self.tx_power_dbm[tx_idx])
-        pt_mw  = self.compute_tx_power_mw(pt_dbm)
-        # Use a small configurable desired-link distance (proxy to paired Rx)
+        pt_mw = self.compute_tx_power_mw(pt_dbm)
         d_sig = float(self.desired_link_distance_m)
         g_sig = self._path_loss_gain_sample(d_sig, self.pathloss_n_los, self.pathloss_n_nlos)
         S = pt_mw * g_sig
 
-        # --- Interference (sum over all co-channel interferers within range) ---
+        # Interference
         I = 0.0
         for j in range(self.N):
             if j == tx_idx or int(actions[j]) != ai:
@@ -267,48 +265,40 @@ class HighwayMultiAgentEnvSQL:
             if d_ij > self.interf_range:
                 continue
             ptj_dbm = float(self.tx_power_dbm[j])
-            ptj_mw  = self.compute_tx_power_mw(ptj_dbm)
+            ptj_mw = self.compute_tx_power_mw(ptj_dbm)
             g_ij = self._path_loss_gain_sample(d_ij, self.pathloss_n_los, self.pathloss_n_nlos)
             I += ptj_mw * g_ij
 
-        # --- Noise ---
         N = float(self.noise_mw)
-
         return S / (I + N + 1e-18)
 
     def compute_sinr_db(self, tx_idx: int, actions: np.ndarray) -> float:
         sinr_lin = self.compute_sinr_linear(tx_idx, actions)
         return 10.0 * np.log10(max(1e-18, sinr_lin))
 
-
-
     # ---------- Helpers: geometry, distances, history ----------
     def _lane_y(self, lane_idx: np.ndarray) -> np.ndarray:
         return self.lane_centers_y[lane_idx]
 
     def _ring_dx(self, xi, xj) -> float:
-        """
-        Signed shortest dx on the ring (for completeness).
-        """
-        dx = (xj - xi + self.L/2) % self.L - self.L/2
+        """Signed shortest dx on the ring (for completeness)."""
+        dx = (xj - xi + self.L / 2) % self.L - self.L / 2
         return float(dx)
 
     def _ring_distance_2d(self, xi, yi, xj, yj) -> float:
-        """
-        Euclidean distance using ring metric in x and direct in y.
-        """
-        dx = abs((xi - xj + self.L/2) % self.L - self.L/2)
+        """Euclidean distance using ring metric in x and direct in y."""
+        dx = abs((xi - xj + self.L / 2) % self.L - self.L / 2)
         dy = abs(yi - yj)
         return float(np.hypot(dx, dy))
 
     def _reset_history(self):
         self.hist = {
-            "x": [],            # shape (t, N)
-            "lane": [],         # shape (t, N)
-            "y": [],            # derived from lane
-            "v": [],            # speeds
-            "labels": [],       # 0..3
-            "actions": []       # 0..2 (per step, so length t-1 compared to x)
+            "x": [],
+            "lane": [],
+            "y": [],
+            "v": [],
+            "labels": [],
+            "actions": []
         }
 
     def _log_timestep(self, x, lane, v, labels, actions=None):
@@ -330,7 +320,6 @@ class HighwayMultiAgentEnvSQL:
         self.lane = self.lane0.copy()
         self.s = np.zeros(self.N, dtype=int)  # idle
         self._reset_history()
-        # log t=0
         self._log_timestep(self.x, self.lane, self.v, self.s, actions=None)
         return self._obs()
 
@@ -350,14 +339,11 @@ class HighwayMultiAgentEnvSQL:
         assert actions.shape[0] == self.N
         assert np.all((0 <= actions) & (actions < self.R))
 
-        unavailable = (np.random.random(self.N) < self.p_block_unavailable)
+        # reproducible RNG
+        unavailable = (self.rng.random(self.N) < self.p_block_unavailable)
 
         rewards = np.zeros(self.N, dtype=float)
         labels = np.zeros(self.N, dtype=int)
-
-        # --- Interference / SNR success-vs-collision ---
-        # Use Euclidean distance in 2D (ring in x, fixed y by lane).
-        y_now = self._lane_y(self.lane)
 
         for i in range(self.N):
             if unavailable[i]:
@@ -365,38 +351,27 @@ class HighwayMultiAgentEnvSQL:
                 rewards[i] = 0.0
                 continue
 
+            sinr_db = self.compute_sinr_db(i, actions)
             ai = int(actions[i])
 
-            # interferers on same resource within range
-            interferers = []
-            for j in range(self.N):
-                if j == i or actions[j] != ai:
-                    continue
-                d_ij = self._ring_distance_2d(self.x[i], y_now[i], self.x[j], y_now[j])
-                if d_ij <= self.interf_range:
-                    interferers.append((j, d_ij))
+            # 1) Try DB binning
+            p_success = self._p_success_from_snr_bin(ai, sinr_db)
+            # 2) Else try interpolation
+            if p_success is None:
+                p_success = self._p_success_from_snr_interp(ai, sinr_db)
+            # 3) If still None, conservative default = 0
+            if p_success is None:
+                p_success = 0.0
 
-            # --- Compute SNR/SINR --
-            sinr_db = self.compute_sinr_db(i, actions)
+            ok = (self.rng.random() < float(p_success))
+            labels[i]  = 1 if ok else 2
+            rewards[i] = 10.0 if ok else -5.0
 
-            if self.snr_success_mode == 'deterministic':
-                if sinr_db >= self.snr_success_thresh_db:
-                    labels[i] = 1; rewards[i] = 10.0
-                else:
-                    labels[i] = 2; rewards[i] = -5.0
-            else:
-                # Stochastic: Bernoulli with P_success = sigmoid(alpha*(sinr_db - thresh))
-                alpha = float(self.snr_prob_alpha)
-                p_success = 1.0 / (1.0 + np.exp(-alpha * (sinr_db - self.snr_success_thresh_db)))
-                if self.rng.random() < p_success:
-                    labels[i] = 1; rewards[i] = 10.0
-                else:
-                    labels[i] = 2; rewards[i] = -5.0
-                    # --- Kinematics: x progression by lane direction ---
-                    lane_dir = self.lane_directions[self.lane]  # +1 or -1 per agent
-                    self.x = (self.x + lane_dir * self.v * self.dt) % self.L
-                    self.v = np.clip(self.v + self.rng.normal(0, 0.2, size=self.N), self.v_min, self.v_max)
-                    self.s = labels
+        # Kinematics: update once per step
+        lane_dir = self.lane_directions[self.lane]  # +1 or -1 per agent
+        self.x = (self.x + lane_dir * self.v * self.dt) % self.L
+        self.v = np.clip(self.v + self.rng.normal(0, 0.2, size=self.N), self.v_min, self.v_max)
+        self.s = labels
 
         obs = self._obs()
         done = False
@@ -421,10 +396,10 @@ class HighwayMultiAgentEnvSQL:
         actions_hist = []
         rewards_hist = []
 
-        for _ in range(self.T+1):
+        for _ in range(self.T + 1):
             acts = np.zeros(self.N, dtype=int)
             for i in range(self.N):
-                pi = policies[i][ self.s[i] ]
+                pi = policies[i][self.s[i]]
                 acts[i] = np.random.choice(3, p=pi)
             obs, r, done, info = self.step(acts)
             actions_hist.append(acts.copy())
@@ -446,7 +421,6 @@ class HighwayMultiAgentEnvSQL:
         """
         if not self.store_history or len(self.hist["x"]) == 0:
             return {}
-        # pad actions to align with x timeline (T+1)
         actions = self.hist["actions"]
         if len(actions) < len(self.hist["x"]):
             pad = np.full((1, self.N), np.nan)
@@ -463,9 +437,7 @@ class HighwayMultiAgentEnvSQL:
         }
 
     def summarize_layout(self) -> Dict[str, np.ndarray]:
-        """
-        Basic geometry summary: lane centers, directions, lane counts at t=0.
-        """
+        """Basic geometry summary: lane centers, directions, lane counts at t=0."""
         counts = np.bincount(self.lane0, minlength=self.num_lanes_total)
         return {
             "num_lanes_total": np.array([self.num_lanes_total]),
@@ -497,8 +469,7 @@ class HighwayMultiAgentEnvSQL:
                 if idx.size < 2:
                     continue
                 xs = np.sort(X[t, idx])
-                # ring gaps within this lane
-                diffs = np.diff(xs, append=xs[0] + L)
+                diffs = np.diff(xs, append=xs[0] + L)  # ring gaps
                 mean_gap[t, ell] = diffs.mean()
                 min_gap[t, ell] = diffs.min()
         return {"mean_gap_per_lane": mean_gap, "min_gap_per_lane": min_gap}
@@ -510,11 +481,11 @@ class HighwayMultiAgentEnvSQL:
 
 def behavior_policy() -> np.ndarray:
     """π_b(a|s): uniform over actions for every label."""
-    return np.ones((4,3)) / 3.0
+    return np.ones((4, 3)) / 3.0
 
 def evaluation_policy() -> np.ndarray:
     """π_e(a|s): biased towards action 0 on {idle, success}; exploratory on {collision, unavailable}."""
-    p = np.zeros((4,3))
+    p = np.zeros((4, 3))
     p[0] = np.array([0.7, 0.2, 0.1])  # idle
     p[1] = np.array([0.7, 0.2, 0.1])  # success
     p[2] = np.array([0.5, 0.3, 0.2])  # collision
