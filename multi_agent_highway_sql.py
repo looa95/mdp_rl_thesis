@@ -37,7 +37,20 @@ class HighwayMultiAgentEnvSQL:
         num_lanes_total: int = 4,
         lane_width: float = 4,
         lane_directions: Optional[List[int]] = None,  # e.g., [+1,+1,-1,-1]; if None, first half +1, rest -1
-        store_history: bool = True
+        store_history: bool = True,
+        #radio propagation params
+        noise_mw: float = 1e-9,  # thermal noise in mW
+        pathloss_n_los: float = 2.0,  # path-loss exponent for LOS
+        pathloss_n_nlos: float = 3.5,  # path-loss exponent for NLOS
+        desired_link_distance_m: float = 10.0, # desired signal link distance in meters
+        # -- decision rules --
+        snr_success_mode: str = "deterministic", #deterministic or stochastic
+        snr_prob_alpha: float = .8, #only for stochastic mode, controls steepness of logistic success probability
+        # -- init spacing
+        min_initial_gap: float = 2.0  # meters ≥2 m within each lane at t=0
+
+
+
     ) -> None:
         self.N = num_agents
         self.T = T
@@ -50,7 +63,15 @@ class HighwayMultiAgentEnvSQL:
         self.db_path = db_path
         self.rng = np.random.default_rng(seed)
         self.R = 3  # actions/resources
+        self.noise_mw = noise_mw
+        self.pathloss_n_los = pathloss_n_los
+        self.pathloss_n_nlos = pathloss_n_nlos
+        self.desired_link_distance_m = desired_link_distance_m
+        self.snr_success_mode = snr_success_mode
+        self.snr_prob_alpha = snr_prob_alpha
+        self.min_initial_gap = min_initial_gap
 
+        min_gap=self.min_initial_gap
         # --- Lanes / directions ---
         assert num_lanes_total >= 1
         self.num_lanes_total = num_lanes_total
@@ -215,35 +236,6 @@ class HighwayMultiAgentEnvSQL:
         # simple power-law gain; you can replace by log-distance with reference if you like
         return 1.0 / (d ** n + 1e-12)
     
-    def compute_sinr(self, tx_idx: int, actions: np.ndarray, noise_mw: float = 1e-9) -> float:
-        """
-        Compute SINR for agent `tx_idx` given current positions/lanes.
-        - Uses distance-based path loss.
-        - S = desired power from self transmitter.
-        - I = sum of powers from all other co-channel transmitters.
-        - N = thermal noise (default very small).
-        
-        Returns SINR (linear ratio).
-        """
-        ai = actions[tx_idx]
-        xi, yi = self.x[tx_idx], self._lane_y(self.lane)[tx_idx]
-        pt_dbm = self.tx_power_dbm[tx_idx]
-        pt_mw = self.compute_tx_power_mw(pt_dbm)
-
-        # Desired received power
-        S = pt_mw * self.compute_path_loss(1.0)  # assume 1 m reference distance
-
-        I = 0.0
-        for j in range(self.N):
-            if j == tx_idx or actions[j] != ai:
-                continue
-            xj, yj = self.x[j], self._lane_y(self.lane)[j]
-            d = self._ring_distance_2d(xi, yi, xj, yj)
-            ptj_mw = self.compute_tx_power_mw(self.tx_power_dbm[j])
-            I += ptj_mw * self.compute_path_loss(d)
-
-        SINR = S / (I + noise_mw)
-        return SINR
     def compute_sinr_linear(self, tx_idx: int, actions: np.ndarray) -> float:
         """
         SINR = S / (I + N) in linear units (mW/mW).
@@ -259,7 +251,7 @@ class HighwayMultiAgentEnvSQL:
 
         # --- Desired signal ---
         pt_dbm = float(self.tx_power_dbm[tx_idx])
-        pt_mw  = self._dbm_to_mw(pt_dbm)
+        pt_mw  = self.compute_tx_power_mw(pt_dbm)
         # Use a small configurable desired-link distance (proxy to paired Rx)
         d_sig = float(self.desired_link_distance_m)
         g_sig = self._path_loss_gain_sample(d_sig, self.pathloss_n_los, self.pathloss_n_nlos)
@@ -275,7 +267,7 @@ class HighwayMultiAgentEnvSQL:
             if d_ij > self.interf_range:
                 continue
             ptj_dbm = float(self.tx_power_dbm[j])
-            ptj_mw  = self._dbm_to_mw(ptj_dbm)
+            ptj_mw  = self.compute_tx_power_mw(ptj_dbm)
             g_ij = self._path_loss_gain_sample(d_ij, self.pathloss_n_los, self.pathloss_n_nlos)
             I += ptj_mw * g_ij
 
@@ -384,28 +376,27 @@ class HighwayMultiAgentEnvSQL:
                 if d_ij <= self.interf_range:
                     interferers.append((j, d_ij))
 
-            if not interferers:
-                labels[i] = 1
-                rewards[i] = 10.0
-                continue
+            # --- Compute SNR/SINR --
+            sinr_db = self.compute_sinr_db(i, actions)
 
-            # closest interferer for conservative decision
-            _, d_star = min(interferers, key=lambda t: t[1])
-            snr_db = self._snr_lookup(resource=ai, tx_power_dbm=int(self.tx_power_dbm[i]), distance_m=float(d_star))
-
-            if snr_db is None:
-                labels[i] = 2; rewards[i] = -5.0
-            else:
-                if snr_db >= self.snr_success_thresh_db:
+            if self.snr_success_mode == 'deterministic':
+                if sinr_db >= self.snr_success_thresh_db:
                     labels[i] = 1; rewards[i] = 10.0
                 else:
                     labels[i] = 2; rewards[i] = -5.0
-
-        # --- Kinematics: x progression by lane direction ---
-        lane_dir = self.lane_directions[self.lane]  # +1 or -1 per agent
-        self.x = (self.x + lane_dir * self.v * self.dt) % self.L
-        self.v = np.clip(self.v + self.rng.normal(0, 0.2, size=self.N), self.v_min, self.v_max)
-        self.s = labels
+            else:
+                # Stochastic: Bernoulli with P_success = sigmoid(alpha*(sinr_db - thresh))
+                alpha = float(self.snr_prob_alpha)
+                p_success = 1.0 / (1.0 + np.exp(-alpha * (sinr_db - self.snr_success_thresh_db)))
+                if self.rng.random() < p_success:
+                    labels[i] = 1; rewards[i] = 10.0
+                else:
+                    labels[i] = 2; rewards[i] = -5.0
+                    # --- Kinematics: x progression by lane direction ---
+                    lane_dir = self.lane_directions[self.lane]  # +1 or -1 per agent
+                    self.x = (self.x + lane_dir * self.v * self.dt) % self.L
+                    self.v = np.clip(self.v + self.rng.normal(0, 0.2, size=self.N), self.v_min, self.v_max)
+                    self.s = labels
 
         obs = self._obs()
         done = False
@@ -514,7 +505,7 @@ class HighwayMultiAgentEnvSQL:
 
 
 # ---------------------------
-# Thesis-aligned policies
+# Thesis policies
 # ---------------------------
 
 def behavior_policy() -> np.ndarray:
