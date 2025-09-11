@@ -1,6 +1,7 @@
 import numpy as np
 import sqlite3
 from typing import List, Tuple, Dict, Optional
+import pandas as pd
 
 class HighwayMultiAgentEnvSQL:
     """
@@ -35,6 +36,7 @@ class HighwayMultiAgentEnvSQL:
         v_max: float = 33.0,
         dt: float = 1.0,
         db_path: str = "radio_model.db",
+        bler_table_path: Optional[str] = None,
         interference_max_range: float = 500.0,
         p_block_unavailable: float = 0.0,
         seed: Optional[int] = 20,
@@ -61,6 +63,23 @@ class HighwayMultiAgentEnvSQL:
         self.interf_range = interference_max_range
         self.p_block_unavailable = p_block_unavailable
         self.db_path = db_path
+        self.bler_table = None
+        if bler_table_path is not None:
+            self.bler_table= pd.read_csv(bler_table_path)
+            df = self.bler_table
+            cols = set(df.columns)
+            points = []
+            # If there are explicit points
+            if {"resource", "snr_db", "bler"}.issubset(cols):
+                points.append(df[["resource", "snr_db", "bler"]].copy())
+            # If there are bins, convert to midpoints for interpolation
+            if {"resource", "snr_min_db", "snr_max_db", "bler"}.issubset(cols):
+                mid = 0.5 * (df["snr_min_db"] + df["snr_max_db"])
+                p2 = pd.DataFrame({"resource": df["resource"], "snr_db": mid, "bler": df["bler"]})
+                points.append(p2)
+            if points:
+                self._bler_points = pd.concat(points, ignore_index=True)
+                self._bler_points.sort_values(["resource", "snr_db"], inplace=True)
         self.rng = np.random.default_rng(seed)
         self.R = 3  # actions/resources
 
@@ -135,6 +154,24 @@ class HighwayMultiAgentEnvSQL:
         Schema:
           snr_success_prob(resource INTEGER, snr_min_db REAL, snr_max_db REAL, p_success REAL)
         """
+
+        # Mode one fron csv table
+        if self.bler_table is not None:
+            df = self.bler_table
+            if {"resource", "snr_min_db", "snr_max_db", "bler"}.issubset(df.columns):
+                mask = (
+                    (df["resource"] == resource) &
+                    (snr_db >= df["snr_min_db"]) &
+                    (snr_db < df["snr_max_db"])
+                )
+                row = df[mask]
+                if not row.empty:
+                    bler = float(row["bler"].iloc[0])
+                    return max(0.0, min(1.0, 1.0 - bler))
+            # If only point data exists, no bin match; let interpolation handle it
+            return None
+        
+        #mode 2 database
         try:
             with self._connect() as conn:
                 cur = conn.cursor()
@@ -162,6 +199,28 @@ class HighwayMultiAgentEnvSQL:
         Schema:
           snr_success_curve(resource INTEGER, snr_db REAL, p_success REAL)
         """
+
+        # Mode 1 only a table
+        if self._bler_points is not None:
+            df = self._bler_points[self._bler_points["sinr_db"] == resource]
+            if df.empty:
+                return None
+            left = df[df["snr_db"] <= snr_db].sort_values("snr_db", ascending=False).head(1)
+            right = df[df["snr_db"] > snr_db].sort_values("snr_db", ascending=True).head(1)
+            if not left.empty and not right.empty:
+                x0, y0 = float(left["snr_db"].iloc[0]), 1.0 - float(left["bler"].iloc[0])
+                x1, y1 = float(right["snr_db"].iloc[0]), 1.0 - float(right["bler"].iloc[0])
+                if x1 == x0:
+                    return max(0.0, min(1.0, 0.5 * (y0 + y1)))
+                t = (snr_db - x0) / (x1 - x0)
+                return max(0.0, min(1.0, y0 + t * (y1 - y0)))
+            elif not left.empty:
+                return max(0.0, min(1.0, 1.0 - float(left["bler"].iloc[0])))
+            elif not right.empty:
+                return max(0.0, min(1.0, 1.0 - float(right["bler"].iloc[0])))
+            return None
+
+        #Mode 2 database    
         try:
             with self._connect() as conn:
                 cur = conn.cursor()
@@ -500,20 +559,32 @@ def evaluation_policy() -> np.ndarray:
 def simulate_highway_multiagent_sql(
     N: int = 20, T: int = 100, seed: int = 20,
     db_path: str = "radio_model.db",
+    bler_table_path: Optional[str] = None,
     interference_max_range: float = 500.0,
     num_lanes_total: int = 4,
     lane_width: float = 3.75,
     lane_directions: Optional[List[int]] = None,
-    store_history: bool = True
+    noise_mw: float = 1e-9,
+    p_block_unavailable: float = 0.0,  
+    store_history: bool = True,
+    tx_power_dbm: Optional[np.ndarray] = None,  
+    pathloss_n_los: float = 2.0,         # LOS path-loss exponent
+    pathloss_n_nlos: float = 3.5,        # NLOS path-loss exponent
+    desired_link_distance_m: float = 10.0,  # desired signal link distance in meters
+    min_initial_gap: float = 2.0         # meters; ≥2 m within each lane at t=0
 ) -> dict:
     """
     Runs one rollout with behavior policy and one with evaluation policy.
     Returns time series of avg rewards and label rates, raw histories, and geometry summaries.
     """
     env = HighwayMultiAgentEnvSQL(
-        num_agents=N, T=T, seed=seed, db_path=db_path,
+        num_agents=N, T=T, seed=seed, db_path=db_path, bler_table_path=bler_table_path, 
         interference_max_range=interference_max_range,
-        num_lanes_total=num_lanes_total, lane_width=lane_width,
+        num_lanes_total=num_lanes_total, lane_width=lane_width, noise_mw=noise_mw,
+        p_block_unavailable=p_block_unavailable, tx_power_dbm=tx_power_dbm,
+        pathloss_n_los=pathloss_n_los, pathloss_n_nlos=pathloss_n_nlos,
+        desired_link_distance_m=desired_link_distance_m,
+        min_initial_gap=min_initial_gap,   
         lane_directions=lane_directions, store_history=store_history
     )
     pi_b = behavior_policy()
