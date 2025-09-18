@@ -66,7 +66,7 @@ class HighwayMultiAgentEnvSQL:
         self.bler_table = None
         self._bler_points = None  # DataFrame with columns: resource, snr_db, bler
         
-        self._init_bler_from_csv(bler_table_path)
+        self._init_bler_from_csv(bler_table_path) 
        
         if bler_table_path is not None:
             self.bler_table= pd.read_csv(bler_table_path)
@@ -568,6 +568,29 @@ class HighwayMultiAgentEnvSQL:
                 mean_gap[t, ell] = diffs.mean()
                 min_gap[t, ell] = diffs.min()
         return {"mean_gap_per_lane": mean_gap, "min_gap_per_lane": min_gap}
+    
+    def _init_bler_from_csv(self, bler_table_path: Optional[str]):
+        """Load CSV and build self.bler_table and self._bler_points (for interpolation)."""
+        self.bler_table = None
+        self._bler_points = None
+        if bler_table_path is None:
+            return
+
+        df = pd.read_csv(bler_table_path)
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        # Expect your CSV format: sinr_db, mcs_0_bler
+        if "sinr_db" in df.columns and "mcs_0_bler" in df.columns:
+            df = df.rename(columns={"sinr_db": "snr_db", "mcs_0_bler": "bler"})
+            df["resource"] = 0   # assume single resource
+        else:
+            raise ValueError("CSV must contain 'sinr_db' and 'mcs_0_bler' columns")
+
+        self.bler_table = df.copy()
+        # For interpolation we just use these points
+        self._bler_points = df[["resource", "snr_db", "bler"]].copy()
+        self._bler_points.sort_values(["resource", "snr_db"], inplace=True)
+
 
 
 # ---------------------------
@@ -587,29 +610,6 @@ def evaluation_policy() -> np.ndarray:
     p[3] = np.array([0.5, 0.3, 0.2])  # unavailable
     return p
 
-def _init_bler_from_csv(self, bler_table_path: Optional[str]):
-    """Load CSV and build self.bler_table and self._bler_points (for interpolation)."""
-    self.bler_table = None
-    self._bler_points = None
-    if bler_table_path is None:
-        return
-
-    df = pd.read_csv(bler_table_path)
-    # Normalize column names
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    # Map your file's columns to standard names
-    if "sinr_db" in df.columns and "mcs_0_bler" in df.columns:
-        df = df.rename(columns={"sinr_db": "snr_db", "mcs_0_bler": "bler"})
-        df["resource"] = 0   # assume single resource
-    else:
-        raise ValueError("CSV does not contain expected columns: 'sinr_db' and 'mcs_0_bler'")
-
-    self.bler_table = df.copy()
-
-    # Build points table for interpolation
-    self._bler_points = df[["resource", "snr_db", "bler"]].copy()
-    self._bler_points.sort_values(["resource", "snr_db"], inplace=True)
 
 
 
