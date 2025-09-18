@@ -64,6 +64,10 @@ class HighwayMultiAgentEnvSQL:
         self.p_block_unavailable = p_block_unavailable
         self.db_path = db_path
         self.bler_table = None
+        self._bler_points = None  # DataFrame with columns: resource, snr_db, bler
+        
+        self._init_bler_from_csv(bler_table_path)
+       
         if bler_table_path is not None:
             self.bler_table= pd.read_csv(bler_table_path)
             df = self.bler_table
@@ -155,23 +159,24 @@ class HighwayMultiAgentEnvSQL:
           snr_success_prob(resource INTEGER, snr_min_db REAL, snr_max_db REAL, p_success REAL)
         """
 
-        # Mode one fron csv table
+        # --- CSV mode: exact bin if present ---
         if self.bler_table is not None:
             df = self.bler_table
-            if {"resource", "snr_min_db", "snr_max_db", "bler"}.issubset(df.columns):
+            cols = set(df.columns)
+            if {"resource", "snr_min_db", "snr_max_db", "bler"}.issubset(cols):
                 mask = (
                     (df["resource"] == resource) &
                     (snr_db >= df["snr_min_db"]) &
-                    (snr_db < df["snr_max_db"])
+                    (snr_db <  df["snr_max_db"])
                 )
                 row = df[mask]
                 if not row.empty:
                     bler = float(row["bler"].iloc[0])
                     return max(0.0, min(1.0, 1.0 - bler))
-            # If only point data exists, no bin match; let interpolation handle it
+            # If no matching bin (or only point data), let interpolation attempt it.
             return None
-        
-        #mode 2 database
+
+        # Mode 2: database
         try:
             with self._connect() as conn:
                 cur = conn.cursor()
@@ -200,24 +205,55 @@ class HighwayMultiAgentEnvSQL:
           snr_success_curve(resource INTEGER, snr_db REAL, p_success REAL)
         """
 
-        # Mode 1 only a table
-        if self._bler_points is not None:
-            df = self._bler_points[self._bler_points["sinr_db"] == resource]
-            if df.empty:
-                return None
-            left = df[df["snr_db"] <= snr_db].sort_values("snr_db", ascending=False).head(1)
-            right = df[df["snr_db"] > snr_db].sort_values("snr_db", ascending=True).head(1)
-            if not left.empty and not right.empty:
-                x0, y0 = float(left["snr_db"].iloc[0]), 1.0 - float(left["bler"].iloc[0])
-                x1, y1 = float(right["snr_db"].iloc[0]), 1.0 - float(right["bler"].iloc[0])
-                if x1 == x0:
-                    return max(0.0, min(1.0, 0.5 * (y0 + y1)))
-                t = (snr_db - x0) / (x1 - x0)
-                return max(0.0, min(1.0, y0 + t * (y1 - y0)))
-            elif not left.empty:
-                return max(0.0, min(1.0, 1.0 - float(left["bler"].iloc[0])))
-            elif not right.empty:
-                return max(0.0, min(1.0, 1.0 - float(right["bler"].iloc[0])))
+       # --- CSV mode: interpolate using points if available; else derive from bins ---
+        if self.bler_table is not None:
+            df = self.bler_table
+            cols = set(df.columns)
+
+            # Prefer prepared points if we built them
+            if self._bler_points is not None:
+                P = self._bler_points[self._bler_points["resource"] == resource]
+                if not P.empty:
+                    left  = P[P["snr_db"] <= snr_db].sort_values("snr_db", ascending=False).head(1)
+                    right = P[P["snr_db"] >  snr_db].sort_values("snr_db", ascending=True ).head(1)
+                    if not left.empty and not right.empty:
+                        x0, y0 = float(left["snr_db"].iloc[0]),  1.0 - float(left["bler"].iloc[0])
+                        x1, y1 = float(right["snr_db"].iloc[0]), 1.0 - float(right["bler"].iloc[0])
+                        if x1 == x0:
+                            return max(0.0, min(1.0, 0.5*(y0+y1)))
+                        t = (snr_db - x0) / (x1 - x0)
+                        return max(0.0, min(1.0, y0 + t*(y1 - y0)))
+                    elif not left.empty:
+                        return max(0.0, min(1.0, 1.0 - float(left["bler"].iloc[0])))
+                    elif not right.empty:
+                        return max(0.0, min(1.0, 1.0 - float(right["bler"].iloc[0])))
+
+            # If we reach here and only have bins, interpolate using bin-edge midpoints on-the-fly
+            if {"resource", "snr_min_db", "snr_max_db", "bler"}.issubset(cols):
+                B = df[df["resource"] == resource].copy()
+                if B.empty:
+                    return None
+                B = B.sort_values("snr_min_db")
+                # Left neighbor: highest bin with snr_max_db <= snr_db
+                left_bins  = B[B["snr_max_db"] <= snr_db]
+                right_bins = B[B["snr_min_db"] >  snr_db]
+                if not left_bins.empty and not right_bins.empty:
+                    l = left_bins.iloc[-1]
+                    r = right_bins.iloc[0]
+                    x0 = 0.5*(float(l["snr_min_db"]) + float(l["snr_max_db"]))
+                    y0 = 1.0 - float(l["bler"])
+                    x1 = 0.5*(float(r["snr_min_db"]) + float(r["snr_max_db"]))
+                    y1 = 1.0 - float(r["bler"])
+                    if x1 == x0:
+                        return max(0.0, min(1.0, 0.5*(y0+y1)))
+                    t = (snr_db - x0) / (x1 - x0)
+                    return max(0.0, min(1.0, y0 + t*(y1 - y0)))
+                elif not left_bins.empty:
+                    l = left_bins.iloc[-1]
+                    return max(0.0, min(1.0, 1.0 - float(l["bler"])))
+                elif not right_bins.empty:
+                    r = right_bins.iloc[0]
+                    return max(0.0, min(1.0, 1.0 - float(r["bler"])))
             return None
 
         #Mode 2 database    
@@ -551,6 +587,32 @@ def evaluation_policy() -> np.ndarray:
     p[3] = np.array([0.5, 0.3, 0.2])  # unavailable
     return p
 
+def _init_bler_from_csv(self, bler_table_path: Optional[str]):
+    """Load CSV and build self.bler_table and self._bler_points (for interpolation)."""
+    self.bler_table = None
+    self._bler_points = None
+    if bler_table_path is None:
+        return
+
+    df = pd.read_csv(bler_table_path)
+    # Normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    # Map your file's columns to standard names
+    if "sinr_db" in df.columns and "mcs_0_bler" in df.columns:
+        df = df.rename(columns={"sinr_db": "snr_db", "mcs_0_bler": "bler"})
+        df["resource"] = 0   # assume single resource
+    else:
+        raise ValueError("CSV does not contain expected columns: 'sinr_db' and 'mcs_0_bler'")
+
+    self.bler_table = df.copy()
+
+    # Build points table for interpolation
+    self._bler_points = df[["resource", "snr_db", "bler"]].copy()
+    self._bler_points.sort_values(["resource", "snr_db"], inplace=True)
+
+
+
 
 # ---------------------------
 # Convenience runner
@@ -558,7 +620,7 @@ def evaluation_policy() -> np.ndarray:
 
 def simulate_highway_multiagent_sql(
     N: int = 20, T: int = 100, seed: int = 20,
-    db_path: str = "radio_model.db",
+    db_path: str = None,
     bler_table_path: Optional[str] = None,
     interference_max_range: float = 500.0,
     num_lanes_total: int = 4,
