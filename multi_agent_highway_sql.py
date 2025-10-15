@@ -604,11 +604,51 @@ def behavior_policy() -> np.ndarray:
 def evaluation_policy() -> np.ndarray:
     """π_e(a|s): biased towards action 0 on {idle, success}; exploratory on {collision, unavailable}."""
     p = np.zeros((4, 3))
-    p[0] = np.array([0.7, 0.2, 0.1])  # idle
-    p[1] = np.array([0.7, 0.2, 0.1])  # success
-    p[2] = np.array([0.5, 0.3, 0.2])  # collision
-    p[3] = np.array([0.5, 0.3, 0.2])  # unavailable
+    p[0] = np.array([0.0, 1.0, 0])  # idle
+    p[1] = np.array([1, 0, 0])  # success
+    p[2] = np.array([1, 0, 0])  # collision
+    p[3] = np.array([0, 1, 0])  # unavailable
     return p
+
+def make_group_policies(N: int,
+                        platoon_idx: List[int],
+                        pi_platoon: np.ndarray,
+                        pi_others: np.ndarray) -> List[np.ndarray]:
+    """
+    Return a list of per-agent (4,3) policies. Agents in platoon_idx get pi_platoon, others get pi_others.
+    Each policy must be a (4,3) row-stochastic matrix (rows: labels 0..3, cols: actions 0..2).
+    """
+    out = [pi_others.copy() for _ in range(N)]
+    if platoon_idx:
+        idx = np.asarray(platoon_idx, dtype=int)
+        assert np.all((0 <= idx) & (idx < N))
+        for i in idx:
+            out[i] = pi_platoon.copy()
+    return out
+
+def one_hot_policy(action_by_label: Dict[int, int]) -> np.ndarray:
+    """
+    Build a (4,3) policy that is deterministic per label (one-hot).
+    action_by_label maps label -> action (0..2). Unspecified labels default to action 0.
+    """
+    P = np.zeros((4,3))
+    for s in range(4):
+        a = int(action_by_label.get(s, 0))
+        assert 0 <= a < 3
+        P[s, a] = 1.0
+    return P
+
+def mixed_policy(rows: Dict[int, Tuple[float,float,float]]) -> np.ndarray:
+    """
+    Build a (4,3) policy with custom probabilities for specified labels.
+    Unspecified labels default to uniform.
+    """
+    P = np.ones((4,3))/3.0
+    for s, probs in rows.items():
+        v = np.asarray(probs, dtype=float)
+        assert v.shape == (3,) and np.all(v >= 0) and v.sum() > 0
+        P[s] = v / v.sum()
+    return P
 
 
 
@@ -633,7 +673,10 @@ def simulate_highway_multiagent_sql(
     pathloss_n_los: float = 2.0,         # LOS path-loss exponent
     pathloss_n_nlos: float = 3.5,        # NLOS path-loss exponent
     desired_link_distance_m: float = 10.0,  # desired signal link distance in meters
-    min_initial_gap: float = 2.0         # meters; ≥2 m within each lane at t=0
+    min_initial_gap: float = 2.0,         # meters; ≥2 m within each lane at t=0
+    platoon_indices: Optional[List[int]] = None,
+    platoon_policy: Optional[np.ndarray] = None,
+    others_policy: Optional[np.ndarray] = None,
 ) -> dict:
     """
     Runs one rollout with behavior policy and one with evaluation policy.
@@ -672,6 +715,17 @@ def simulate_highway_multiagent_sql(
 
     succ_b, coll_b, unav_b = rates(labels_b)
     succ_e, coll_e, unav_e = rates(labels_e)
+    
+    labels_g = actions_g = rewards_g = hist_g = None
+    avg_rew_g= succ_g = coll_g = unav_g = None
+    if platoon_indices is not None :
+        pi_platoon = evaluation_policy() if platoon_policy is None else platoon_policy
+        pi_others = behavior_policy() if others_policy is None else others_policy
+        policies = make_group_policies(N, platoon_indices, pi_platoon, pi_others)
+        labels_g, actions_g, rewards_g = env.rollout(policies)
+        hist_g = env.get_history()
+        avg_rew_g = np.array([r.mean() for r in rewards_g])
+        succ_g, coll_g, unav_g = rates(labels_g)        
 
     return {
         "avg_rew_b": avg_rew_b, "avg_rew_e": avg_rew_e,
@@ -681,5 +735,7 @@ def simulate_highway_multiagent_sql(
         "labels_b": labels_b, "actions_b": actions_b, "rewards_b": rewards_b,
         "labels_e": labels_e, "actions_e": actions_e, "rewards_e": rewards_e,
         "history_b": hist_b, "history_e": hist_e,
-        "layout": layout, "spacing": spacing
+        "layout": layout, "spacing": spacing,
+        "avg_rew_group": avg_rew_g, "succ_group": succ_g, "coll_group": coll_g, "unav_group": unav_g,
+        "labels_group": labels_g, "actions_group": actions_g, "rewards_group": rewards_g, "history_group": hist_g
     }
