@@ -450,17 +450,19 @@ class HighwayMultiAgentEnvSQL:
             ai = int(actions[i])
 
             # 1) Try DB binning
-            p_success = self._p_success_from_snr_bin(ai, sinr_db)
+            p_error = self._p_success_from_snr_bin(ai, sinr_db)
             # 2) Else try interpolation
-            if p_success is None:
-                p_success = self._p_success_from_snr_interp(ai, sinr_db)
+            if p_error is None:
+                p_error = self._p_success_from_snr_interp(ai, sinr_db)
             # 3) If still None, conservative default = 0
-            if p_success is None:
-                p_success = 0.0
+            if p_error is None:
+                p_error = 0.0
+            
+            p_success = 1.0 - p_error   
 
             ok = (self.rng.random() < float(p_success))
             labels[i]  = 1 if ok else 2
-            rewards[i] = 10.0 if ok else -5.0
+            rewards[i] = 1.0 if ok else -1.0
 
         # Kinematics: update once per step
         lane_dir = self.lane_directions[self.lane]  # +1 or -1 per agent
@@ -677,6 +679,8 @@ def simulate_highway_multiagent_sql(
     platoon_indices: Optional[List[int]] = None,
     platoon_policy: Optional[np.ndarray] = None,
     others_policy: Optional[np.ndarray] = None,
+    pi_b: Optional[np.ndarray] = None,
+    pi_e: Optional[np.ndarray] = None
 ) -> dict:
     """
     Runs one rollout with behavior policy and one with evaluation policy.
@@ -690,17 +694,19 @@ def simulate_highway_multiagent_sql(
         pathloss_n_los=pathloss_n_los, pathloss_n_nlos=pathloss_n_nlos,
         desired_link_distance_m=desired_link_distance_m,
         min_initial_gap=min_initial_gap,   
-        lane_directions=lane_directions, store_history=store_history
+        lane_directions=lane_directions, store_history=store_history, 
     )
-    pi_b = behavior_policy()
-    pi_e = evaluation_policy()
+    
+    # Use provided policies or default functions
+    policy_b = pi_b if pi_b is not None else behavior_policy()
+    policy_e = pi_e if pi_e is not None else evaluation_policy()
 
-    labels_b, actions_b, rewards_b = env.rollout([pi_b])
+    labels_b, actions_b, rewards_b = env.rollout([policy_b])
     hist_b = env.get_history()
     layout = env.summarize_layout()
     spacing = env.spacing_stats()
 
-    labels_e, actions_e, rewards_e = env.rollout([pi_e])
+    labels_e, actions_e, rewards_e = env.rollout([policy_e])
     hist_e = env.get_history()
 
     avg_rew_b = np.array([r.mean() for r in rewards_b])
@@ -708,34 +714,37 @@ def simulate_highway_multiagent_sql(
 
     def rates(labels_hist):
         labs = np.array(labels_hist[1:])
-        succ = (labs == 1).mean(axis=1)
+        succ = (labs == 1).mean(axis=1)  # Success rate per timestep
         coll = (labs == 2).mean(axis=1)
         unav = (labs == 3).mean(axis=1)
-        return succ, coll, unav
+        avg_succ = succ.mean()  # Average success rate over all timesteps
+        return succ, coll, unav, avg_succ
 
-    succ_b, coll_b, unav_b = rates(labels_b)
-    succ_e, coll_e, unav_e = rates(labels_e)
+    succ_b, coll_b, unav_b, avg_succ_b = rates(labels_b)
+    succ_e, coll_e, unav_e, avg_succ_e = rates(labels_e)
     
     labels_g = actions_g = rewards_g = hist_g = None
-    avg_rew_g= succ_g = coll_g = unav_g = None
-    if platoon_indices is not None :
+    avg_rew_g = succ_g = coll_g = unav_g = avg_succ_g = None
+    if platoon_indices is not None:
         pi_platoon = evaluation_policy() if platoon_policy is None else platoon_policy
         pi_others = behavior_policy() if others_policy is None else others_policy
         policies = make_group_policies(N, platoon_indices, pi_platoon, pi_others)
         labels_g, actions_g, rewards_g = env.rollout(policies)
         hist_g = env.get_history()
         avg_rew_g = np.array([r.mean() for r in rewards_g])
-        succ_g, coll_g, unav_g = rates(labels_g)        
+        succ_g, coll_g, unav_g, avg_succ_g = rates(labels_g)
 
     return {
         "avg_rew_b": avg_rew_b, "avg_rew_e": avg_rew_e,
         "succ_b": succ_b, "succ_e": succ_e,
         "coll_b": coll_b, "coll_e": coll_e,
         "unav_b": unav_b, "unav_e": unav_e,
+        "avg_succ_b": avg_succ_b, "avg_succ_e": avg_succ_e,  # Added average success rates
         "labels_b": labels_b, "actions_b": actions_b, "rewards_b": rewards_b,
         "labels_e": labels_e, "actions_e": actions_e, "rewards_e": rewards_e,
         "history_b": hist_b, "history_e": hist_e,
         "layout": layout, "spacing": spacing,
         "avg_rew_group": avg_rew_g, "succ_group": succ_g, "coll_group": coll_g, "unav_group": unav_g,
+        "avg_succ_group": avg_succ_g,  # Added average success rate for group
         "labels_group": labels_g, "actions_group": actions_g, "rewards_group": rewards_g, "history_group": hist_g
     }
